@@ -43,7 +43,7 @@ if { [string first $scripts_vivado_version $current_vivado_version] == -1 } {
 
 set list_projs [get_projects -quiet]
 if { $list_projs eq "" } {
-   create_project hft_proj hft_proj -part xcku115-flva1517-2-e
+   create_project hft_proj hft_proj -part xc7k325tffg900-2
 }
 
 
@@ -290,6 +290,8 @@ CONFIG.CONST_WIDTH {16} \
 }
 
 # Hierarchical cell: network_module
+# KC705 port: replaced axi_10g_ethernet with axi_ethernet (GMII/1G) + AXI-Stream
+# data-width converters (8-bit MAC <-> 64-bit HLS UDP/IP stack)
 proc create_hier_cell_network_module { parentCell nameHier } {
 
   variable script_folder
@@ -324,107 +326,119 @@ proc create_hier_cell_network_module { parentCell nameHier } {
   current_bd_instance $hier_obj
 
   # Create interface pins
+  # 64-bit AXI-Stream to/from HLS UDP/IP stack (unchanged from 10G design)
   create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:axis_rtl:1.0 M_AXIS
-  create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 S_AXIS
+  create_bd_intf_pin -mode Slave  -vlnv xilinx.com:interface:axis_rtl:1.0 S_AXIS
+  # GMII interface to Marvell 88E1111 PHY on KC705
+  create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:gmii_rtl:1.0 gmii
+  # MDIO management interface to PHY
+  create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:mdio_rtl:1.0 mdio
 
   # Create pins
-  create_bd_pin -dir I aresetn
-  create_bd_pin -dir I -type clk clk_100
-  create_bd_pin -dir O -type clk clk_156
-  create_bd_pin -dir O network_reset_done
-  create_bd_pin -dir I refclk_n
-  create_bd_pin -dir I refclk_p
+  create_bd_pin -dir I           aresetn
+  create_bd_pin -dir I -type clk clk_125
+  create_bd_pin -dir I -type clk clk_200
+  create_bd_pin -dir O           phy_rst_n
   create_bd_pin -dir I -type rst reset
-  create_bd_pin -dir I rxn
-  create_bd_pin -dir I rxp
-  create_bd_pin -dir O txn
-  create_bd_pin -dir O txp
 
-  # Create instance: axi_10g_ethernet_0, and set properties
-  set axi_10g_ethernet_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_10g_ethernet:3.1 axi_10g_ethernet_0 ]
+  # Create instance: axi_ethernet_0 — 1G Tri-Mode Ethernet MAC (GMII mode)
+  set axi_ethernet_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_ethernet:7.2 axi_ethernet_0 ]
   set_property -dict [ list \
-CONFIG.Locations {X1Y16} \
-CONFIG.Management_Interface {false} \
-CONFIG.Statistics_Gathering {false} \
-CONFIG.SupportLevel {1} \
-CONFIG.autonegotiation {false} \
-CONFIG.base_kr {BASE-R} \
-CONFIG.fec {false} \
- ] $axi_10g_ethernet_0
+CONFIG.PHY_TYPE {GMII} \
+CONFIG.ENABLE_LVDS {false} \
+CONFIG.SupportLevel {0} \
+ ] $axi_ethernet_0
 
-  # Create instance: axis_register_slice_0, and set properties
-  set axis_register_slice_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:axis_register_slice:1.1 axis_register_slice_0 ]
+  # Create instance: axis_dwidth_converter_rx — 8-bit MAC RX -> 64-bit stack
+  set axis_dwidth_converter_rx [ create_bd_cell -type ip -vlnv xilinx.com:ip:axis_dwidth_converter:1.1 axis_dwidth_converter_rx ]
   set_property -dict [ list \
-CONFIG.TUSER_WIDTH {0} \
- ] $axis_register_slice_0
+CONFIG.S_TDATA_NUM_BYTES {1} \
+CONFIG.M_TDATA_NUM_BYTES {8} \
+ ] $axis_dwidth_converter_rx
 
-  # Create instance: axis_register_slice_1, and set properties
-  set axis_register_slice_1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:axis_register_slice:1.1 axis_register_slice_1 ]
+  # Create instance: axis_dwidth_converter_tx — 64-bit stack TX -> 8-bit MAC
+  set axis_dwidth_converter_tx [ create_bd_cell -type ip -vlnv xilinx.com:ip:axis_dwidth_converter:1.1 axis_dwidth_converter_tx ]
   set_property -dict [ list \
-CONFIG.TUSER_WIDTH {0} \
- ] $axis_register_slice_1
+CONFIG.S_TDATA_NUM_BYTES {8} \
+CONFIG.M_TDATA_NUM_BYTES {1} \
+ ] $axis_dwidth_converter_tx
 
-  # Create instance: gnd, and set properties
-  set gnd [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 gnd ]
+  # RX status sink — always accept MAC RX status stream (discard it)
+  set rxs_tready [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 rxs_tready ]
   set_property -dict [ list \
-CONFIG.CONST_VAL {0} \
- ] $gnd
+CONFIG.CONST_VAL {1} \
+CONFIG.CONST_WIDTH {1} \
+ ] $rxs_tready
 
-  # Create instance: ifg_delay, and set properties
-  set ifg_delay [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 ifg_delay ]
+  # TX control source — no control/error injection (tvalid=0)
+  set txc_tvalid [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 txc_tvalid ]
   set_property -dict [ list \
 CONFIG.CONST_VAL {0} \
-CONFIG.CONST_WIDTH {8} \
- ] $ifg_delay
-
-  # Create instance: mac_config_vector, and set properties
-  set mac_config_vector [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 mac_config_vector ]
-  set_property -dict [ list \
-CONFIG.CONST_VAL {22} \
-CONFIG.CONST_WIDTH {80} \
- ] $mac_config_vector
-
-  # Create instance: pcs_config_vector, and set properties
-  set pcs_config_vector [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 pcs_config_vector ]
-  set_property -dict [ list \
-CONFIG.CONST_VAL {0} \
-CONFIG.CONST_WIDTH {536} \
- ] $pcs_config_vector
-
-  # Create instance: tx_ifg_tuser, and set properties
-  set tx_ifg_tuser [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 tx_ifg_tuser ]
-  set_property -dict [ list \
-CONFIG.CONST_VAL {0} \
-CONFIG.CONST_WIDTH {16} \
- ] $tx_ifg_tuser
-
-  # Create instance: vcc, and set properties
-  set vcc [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 vcc ]
+CONFIG.CONST_WIDTH {1} \
+ ] $txc_tvalid
 
   # Create interface connections
-  connect_bd_intf_net -intf_net Conn1 [get_bd_intf_pins S_AXIS] [get_bd_intf_pins axis_register_slice_0/S_AXIS]
-  connect_bd_intf_net -intf_net Conn2 [get_bd_intf_pins M_AXIS] [get_bd_intf_pins axis_register_slice_1/M_AXIS]
-  connect_bd_intf_net -intf_net axi_10g_ethernet_0_m_axis_rx [get_bd_intf_pins axi_10g_ethernet_0/m_axis_rx] [get_bd_intf_pins axis_register_slice_1/S_AXIS]
-  connect_bd_intf_net -intf_net axis_register_slice_0_M_AXIS [get_bd_intf_pins axi_10g_ethernet_0/s_axis_tx] [get_bd_intf_pins axis_register_slice_0/M_AXIS]
+  # Expose GMII and MDIO through hierarchy to top-level ports
+  connect_bd_intf_net -intf_net gmii_1 [get_bd_intf_pins gmii] [get_bd_intf_pins axi_ethernet_0/GMII]
+  connect_bd_intf_net -intf_net mdio_1 [get_bd_intf_pins mdio] [get_bd_intf_pins axi_ethernet_0/MDIO]
+
+  # RX path: 8-bit MAC output -> width converter -> 64-bit M_AXIS
+  connect_bd_intf_net -intf_net axi_ethernet_0_m_axis_rxd \
+    [get_bd_intf_pins axi_ethernet_0/m_axis_rxd] \
+    [get_bd_intf_pins axis_dwidth_converter_rx/S_AXIS]
+  connect_bd_intf_net -intf_net axis_dwidth_converter_rx_M_AXIS \
+    [get_bd_intf_pins axis_dwidth_converter_rx/M_AXIS] \
+    [get_bd_intf_pins M_AXIS]
+
+  # TX path: 64-bit S_AXIS -> width converter -> 8-bit MAC input
+  connect_bd_intf_net -intf_net S_AXIS_1 \
+    [get_bd_intf_pins S_AXIS] \
+    [get_bd_intf_pins axis_dwidth_converter_tx/S_AXIS]
+  connect_bd_intf_net -intf_net axis_dwidth_converter_tx_M_AXIS \
+    [get_bd_intf_pins axis_dwidth_converter_tx/M_AXIS] \
+    [get_bd_intf_pins axi_ethernet_0/s_axis_txd]
 
   # Create port connections
-  connect_bd_net -net Net [get_bd_pins aresetn] [get_bd_pins axi_10g_ethernet_0/rx_axis_aresetn] [get_bd_pins axi_10g_ethernet_0/tx_axis_aresetn] [get_bd_pins axis_register_slice_0/aresetn] [get_bd_pins axis_register_slice_1/aresetn]
-  connect_bd_net -net axi_10g_ethernet_0_resetdone_out [get_bd_pins network_reset_done] [get_bd_pins axi_10g_ethernet_0/resetdone_out]
-  connect_bd_net -net axi_10g_ethernet_0_txn [get_bd_pins txn] [get_bd_pins axi_10g_ethernet_0/txn]
-  connect_bd_net -net axi_10g_ethernet_0_txp [get_bd_pins txp] [get_bd_pins axi_10g_ethernet_0/txp]
-  connect_bd_net -net axi_10g_ethernet_0_txusrclk2_out [get_bd_pins clk_156] [get_bd_pins axi_10g_ethernet_0/txusrclk2_out] [get_bd_pins axis_register_slice_0/aclk] [get_bd_pins axis_register_slice_1/aclk]
-  connect_bd_net -net config_vector_dout [get_bd_pins axi_10g_ethernet_0/mac_rx_configuration_vector] [get_bd_pins axi_10g_ethernet_0/mac_tx_configuration_vector] [get_bd_pins mac_config_vector/dout]
-  connect_bd_net -net dclk_1 [get_bd_pins clk_100] [get_bd_pins axi_10g_ethernet_0/dclk]
-  connect_bd_net -net gnd_dout [get_bd_pins axi_10g_ethernet_0/s_axis_pause_tvalid] [get_bd_pins axi_10g_ethernet_0/sim_speedup_control] [get_bd_pins axi_10g_ethernet_0/tx_fault] [get_bd_pins gnd/dout]
-  connect_bd_net -net ifg_delay_dout [get_bd_pins axi_10g_ethernet_0/tx_ifg_delay] [get_bd_pins ifg_delay/dout]
-  connect_bd_net -net pcs_config_vector_dout [get_bd_pins axi_10g_ethernet_0/pcs_pma_configuration_vector] [get_bd_pins pcs_config_vector/dout]
-  connect_bd_net -net refclk_n_1 [get_bd_pins refclk_n] [get_bd_pins axi_10g_ethernet_0/refclk_n]
-  connect_bd_net -net refclk_p_1 [get_bd_pins refclk_p] [get_bd_pins axi_10g_ethernet_0/refclk_p]
-  connect_bd_net -net reset_1 [get_bd_pins reset] [get_bd_pins axi_10g_ethernet_0/reset]
-  connect_bd_net -net rxn_1 [get_bd_pins rxn] [get_bd_pins axi_10g_ethernet_0/rxn]
-  connect_bd_net -net rxp_1 [get_bd_pins rxp] [get_bd_pins axi_10g_ethernet_0/rxp]
-  connect_bd_net -net tx_ifg_tuser_dout [get_bd_pins axi_10g_ethernet_0/s_axis_pause_tdata] [get_bd_pins tx_ifg_tuser/dout]
-  connect_bd_net -net vcc_dout [get_bd_pins axi_10g_ethernet_0/signal_detect] [get_bd_pins vcc/dout]
+  # 125 MHz GTX clock to MAC
+  connect_bd_net -net clk_125_1 \
+    [get_bd_pins clk_125] \
+    [get_bd_pins axi_ethernet_0/gtx_clk]
+
+  # 200 MHz processing clock to AXI-Stream width converters
+  connect_bd_net -net clk_200_1 \
+    [get_bd_pins clk_200] \
+    [get_bd_pins axis_dwidth_converter_rx/aclk] \
+    [get_bd_pins axis_dwidth_converter_tx/aclk]
+
+  # Active-low reset to width converters
+  connect_bd_net -net aresetn_1 \
+    [get_bd_pins aresetn] \
+    [get_bd_pins axis_dwidth_converter_rx/aresetn] \
+    [get_bd_pins axis_dwidth_converter_tx/aresetn] \
+    [get_bd_pins axi_ethernet_0/axi_txd_arstn] \
+    [get_bd_pins axi_ethernet_0/axi_txc_arstn] \
+    [get_bd_pins axi_ethernet_0/axi_rxd_arstn] \
+    [get_bd_pins axi_ethernet_0/axi_rxs_arstn]
+
+  # Active-high global reset to MAC
+  connect_bd_net -net reset_1 \
+    [get_bd_pins reset] \
+    [get_bd_pins axi_ethernet_0/glbl_rst]
+
+  # PHY reset output
+  connect_bd_net -net phy_rst_n_1 \
+    [get_bd_pins phy_rst_n] \
+    [get_bd_pins axi_ethernet_0/phy_rst_n]
+
+  # Always-ready sink for RX status stream
+  connect_bd_net -net rxs_tready_dout \
+    [get_bd_pins rxs_tready/dout] \
+    [get_bd_pins axi_ethernet_0/m_axis_rxs_tready]
+
+  # No TX control frames
+  connect_bd_net -net txc_tvalid_dout \
+    [get_bd_pins txc_tvalid/dout] \
+    [get_bd_pins axi_ethernet_0/s_axis_txc_tvalid]
 
   # Restore current instance
   current_bd_instance $oldCurInst
@@ -549,19 +563,18 @@ proc create_root_design { parentCell } {
 
   # Create ports
   set led_l [ create_bd_port -dir O -from 2 -to 0 led_l ]
-  set perst_n [ create_bd_port -dir I perst_n ]
-  set refclk200 [ create_bd_port -dir I -type clk refclk200 ]
+  set cpu_resetn [ create_bd_port -dir I cpu_resetn ]
+  set sys_diff_clock_clk_p [ create_bd_port -dir I -type clk sys_diff_clock_clk_p ]
   set_property -dict [ list \
 CONFIG.FREQ_HZ {200000000} \
- ] $refclk200
-  set refclk_n [ create_bd_port -dir I refclk_n ]
-  set refclk_p [ create_bd_port -dir I refclk_p ]
-  set rxn [ create_bd_port -dir I rxn ]
-  set rxp [ create_bd_port -dir I rxp ]
-  set sfp_tx_disable [ create_bd_port -dir O -from 1 -to 0 sfp_tx_disable ]
-  set txn [ create_bd_port -dir O txn ]
-  set txp [ create_bd_port -dir O txp ]
+ ] $sys_diff_clock_clk_p
+  set sys_diff_clock_clk_n [ create_bd_port -dir I sys_diff_clock_clk_n ]
+  set phy_rst_n [ create_bd_port -dir O phy_rst_n ]
   set user_sw_l [ create_bd_port -dir I user_sw_l ]
+  # GMII interface port (expands to individual gmii_txd, gmii_tx_en, ... in wrapper)
+  set gmii [ create_bd_intf_port -mode Master -vlnv xilinx.com:interface:gmii_rtl:1.0 gmii ]
+  # MDIO interface port (expands to mdio_mdc, mdio_mdio_io in wrapper)
+  set mdio [ create_bd_intf_port -mode Master -vlnv xilinx.com:interface:mdio_rtl:1.0 mdio ]
 
   # Create instance: MicroblazeToSwitch_0, and set properties
   set MicroblazeToSwitch_0 [ create_bd_cell -type ip -vlnv xilinx.com:hls:MicroblazeToSwitch:1.0 MicroblazeToSwitch_0 ]
@@ -573,8 +586,11 @@ CONFIG.Output_Width {64} \
  ] $c_counter_binary_0
 
   # Create instance: clk_wiz_0, and set properties
+  # KC705: differential 200 MHz input -> clk_200MHz (processing) + clk_125MHz (MAC GTX)
   set clk_wiz_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:5.3 clk_wiz_0 ]
   set_property -dict [ list \
+CONFIG.CLK_IN1_BOARD_INTERFACE {Custom} \
+CONFIG.PRIM_SOURCE {Differential_clock_capable_pin} \
 CONFIG.CLKIN1_JITTER_PS {50.0} \
 CONFIG.CLKOUT1_DRIVES {Buffer} \
 CONFIG.CLKOUT1_JITTER {98.146} \
@@ -582,24 +598,24 @@ CONFIG.CLKOUT1_PHASE_ERROR {89.971} \
 CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {200} \
 CONFIG.CLKOUT1_USED {true} \
 CONFIG.CLKOUT2_DRIVES {Buffer} \
-CONFIG.CLKOUT2_JITTER {98.146} \
+CONFIG.CLKOUT2_JITTER {114.829} \
 CONFIG.CLKOUT2_PHASE_ERROR {89.971} \
-CONFIG.CLKOUT2_REQUESTED_OUT_FREQ {200.000} \
-CONFIG.CLKOUT2_USED {false} \
+CONFIG.CLKOUT2_REQUESTED_OUT_FREQ {125.000} \
+CONFIG.CLKOUT2_USED {true} \
 CONFIG.CLKOUT3_DRIVES {Buffer} \
 CONFIG.CLKOUT4_DRIVES {Buffer} \
 CONFIG.CLKOUT5_DRIVES {Buffer} \
 CONFIG.CLKOUT6_DRIVES {Buffer} \
 CONFIG.CLKOUT7_DRIVES {Buffer} \
-CONFIG.CLK_OUT1_PORT {clk_100MHz} \
-CONFIG.CLK_OUT2_PORT {clk_200MHz} \
+CONFIG.CLK_OUT1_PORT {clk_200MHz} \
+CONFIG.CLK_OUT2_PORT {clk_125MHz} \
 CONFIG.MMCM_CLKFBOUT_MULT_F {5.000} \
 CONFIG.MMCM_CLKIN1_PERIOD {5.0} \
 CONFIG.MMCM_CLKIN2_PERIOD {10.0} \
 CONFIG.MMCM_CLKOUT0_DIVIDE_F {5.000} \
-CONFIG.MMCM_CLKOUT1_DIVIDE {1} \
+CONFIG.MMCM_CLKOUT1_DIVIDE {8} \
 CONFIG.MMCM_DIVCLK_DIVIDE {1} \
-CONFIG.NUM_OUT_CLKS {1} \
+CONFIG.NUM_OUT_CLKS {2} \
 CONFIG.RESET_TYPE {ACTIVE_LOW} \
 CONFIG.USE_LOCKED {false} \
 CONFIG.USE_RESET {false} \
@@ -609,13 +625,11 @@ CONFIG.USE_RESET {false} \
   set_property -dict [ list \
 CONFIG.CLKOUT1_DRIVES.VALUE_SRC {DEFAULT} \
 CONFIG.CLKOUT2_DRIVES.VALUE_SRC {DEFAULT} \
-CONFIG.CLKOUT2_REQUESTED_OUT_FREQ.VALUE_SRC {DEFAULT} \
 CONFIG.CLKOUT3_DRIVES.VALUE_SRC {DEFAULT} \
 CONFIG.CLKOUT4_DRIVES.VALUE_SRC {DEFAULT} \
 CONFIG.CLKOUT5_DRIVES.VALUE_SRC {DEFAULT} \
 CONFIG.CLKOUT6_DRIVES.VALUE_SRC {DEFAULT} \
 CONFIG.CLKOUT7_DRIVES.VALUE_SRC {DEFAULT} \
-CONFIG.CLK_OUT2_PORT.VALUE_SRC {DEFAULT} \
 CONFIG.MMCM_CLKIN2_PERIOD.VALUE_SRC {DEFAULT} \
 CONFIG.RESET_TYPE.VALUE_SRC {DEFAULT} \
  ] $clk_wiz_0
@@ -624,10 +638,11 @@ CONFIG.RESET_TYPE.VALUE_SRC {DEFAULT} \
   set fast_protocol_0 [ create_bd_cell -type ip -vlnv xilinx.com:hls:fast_protocol:1.0 fast_protocol_0 ]
 
   # Create instance: gnd1, and set properties
+  # 1-bit constant zero — used as placeholder for LED In1 (was network_reset_done)
   set gnd1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 gnd1 ]
   set_property -dict [ list \
 CONFIG.CONST_VAL {0} \
-CONFIG.CONST_WIDTH {2} \
+CONFIG.CONST_WIDTH {1} \
  ] $gnd1
 
   # Create instance: ip, and set properties
@@ -692,12 +707,6 @@ CONFIG.NUM_MI {3} \
   # Create instance: udp_ip_wrapper
   create_hier_cell_udp_ip_wrapper [current_bd_instance .] udp_ip_wrapper
 
-  # Create instance: util_vector_logic_0, and set properties
-  set util_vector_logic_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:util_vector_logic:2.0 util_vector_logic_0 ]
-  set_property -dict [ list \
-CONFIG.C_SIZE {1} \
- ] $util_vector_logic_0
-
   # Create instance: util_vector_logic_1, and set properties
   set util_vector_logic_1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:util_vector_logic:2.0 util_vector_logic_1 ]
   set_property -dict [ list \
@@ -756,28 +765,32 @@ CONFIG.NUM_PORTS {3} \
 
   # Create port connections
   connect_bd_net -net c_counter_binary_0_Q [get_bd_pins c_counter_binary_0/Q] [get_bd_pins timer_stream_adapter_0/asyncTime_V]
-  connect_bd_net -net clk_wiz_0_clk_100MHz [get_bd_pins clk_wiz_0/clk_100MHz] [get_bd_pins network_module/clk_100]
-  connect_bd_net -net clk_wiz_0_clk_200MHz [get_bd_pins MicroblazeToSwitch_0/ap_clk] [get_bd_pins c_counter_binary_0/CLK] [get_bd_pins fast_protocol_0/aclk] [get_bd_pins mdm_1/S_AXI_ACLK] [get_bd_pins microblaze_0/Clk] [get_bd_pins microblaze_0_axi_periph/ACLK] [get_bd_pins microblaze_0_axi_periph/M00_ACLK] [get_bd_pins microblaze_0_axi_periph/M01_ACLK] [get_bd_pins microblaze_0_axi_periph/M02_ACLK] [get_bd_pins microblaze_0_axi_periph/S00_ACLK] [get_bd_pins microblaze_0_local_memory/LMB_Clk] [get_bd_pins network_module/clk_156] [get_bd_pins order_book_0/ap_clk] [get_bd_pins proc_sys_reset_0/slowest_sync_clk] [get_bd_pins rst_clk_wiz_0_200M/slowest_sync_clk] [get_bd_pins simple_threshold_0/aclk] [get_bd_pins timer_stream_adapter_0/aclk] [get_bd_pins udpAppMux_0/aclk] [get_bd_pins udp_ip_wrapper/aclk]
-  connect_bd_net -net gnd1_dout [get_bd_ports sfp_tx_disable] [get_bd_pins gnd1/dout]
+  # 200 MHz clock from clk_wiz drives all HLS processing IPs, MicroBlaze, and width converters
+  connect_bd_net -net clk_wiz_0_clk_200MHz [get_bd_pins clk_wiz_0/clk_200MHz] [get_bd_pins MicroblazeToSwitch_0/ap_clk] [get_bd_pins c_counter_binary_0/CLK] [get_bd_pins fast_protocol_0/aclk] [get_bd_pins mdm_1/S_AXI_ACLK] [get_bd_pins microblaze_0/Clk] [get_bd_pins microblaze_0_axi_periph/ACLK] [get_bd_pins microblaze_0_axi_periph/M00_ACLK] [get_bd_pins microblaze_0_axi_periph/M01_ACLK] [get_bd_pins microblaze_0_axi_periph/M02_ACLK] [get_bd_pins microblaze_0_axi_periph/S00_ACLK] [get_bd_pins microblaze_0_local_memory/LMB_Clk] [get_bd_pins network_module/clk_200] [get_bd_pins order_book_0/ap_clk] [get_bd_pins proc_sys_reset_0/slowest_sync_clk] [get_bd_pins rst_clk_wiz_0_200M/slowest_sync_clk] [get_bd_pins simple_threshold_0/aclk] [get_bd_pins timer_stream_adapter_0/aclk] [get_bd_pins udpAppMux_0/aclk] [get_bd_pins udp_ip_wrapper/aclk]
+  # 125 MHz clock to 1G MAC GTX clock input
+  connect_bd_net -net clk_wiz_0_clk_125MHz [get_bd_pins clk_wiz_0/clk_125MHz] [get_bd_pins network_module/clk_125]
+  # gnd1 (1-bit 0) as placeholder for LED In1
+  connect_bd_net -net gnd1_dout [get_bd_pins gnd1/dout] [get_bd_pins xlconcat_0/In1]
   connect_bd_net -net mac_dout [get_bd_pins mac/dout] [get_bd_pins udp_ip_wrapper/myMacAddress_V]
   connect_bd_net -net mdm_1_debug_sys_rst [get_bd_pins mdm_1/Debug_SYS_Rst] [get_bd_pins rst_clk_wiz_0_200M/mb_debug_sys_rst]
-  connect_bd_net -net network_module_network_reset_done [get_bd_pins network_module/network_reset_done] [get_bd_pins util_vector_logic_0/Op2] [get_bd_pins xlconcat_0/In1]
-  connect_bd_net -net network_module_txn [get_bd_ports txn] [get_bd_pins network_module/txn]
-  connect_bd_net -net network_module_txp [get_bd_ports txp] [get_bd_pins network_module/txp]
-  connect_bd_net -net psert_n_1 [get_bd_ports perst_n] [get_bd_pins util_vector_logic_0/Op1] [get_bd_pins util_vector_logic_1/Op1] [get_bd_pins xlconcat_0/In0]
-  connect_bd_net -net refclk200_1 [get_bd_ports refclk200] [get_bd_pins clk_wiz_0/clk_in1]
-  connect_bd_net -net refclk_n_1 [get_bd_ports refclk_n] [get_bd_pins network_module/refclk_n]
-  connect_bd_net -net refclk_p_1 [get_bd_ports refclk_p] [get_bd_pins network_module/refclk_p]
+  # cpu_resetn (active-low): drives reset controllers, LED In0, and NOT gate for network_module reset
+  connect_bd_net -net cpu_resetn_1 [get_bd_ports cpu_resetn] [get_bd_pins proc_sys_reset_0/ext_reset_in] [get_bd_pins rst_clk_wiz_0_200M/ext_reset_in] [get_bd_pins util_vector_logic_1/Op1] [get_bd_pins xlconcat_0/In0]
   connect_bd_net -net regIpAddress_V_1 [get_bd_pins ip/dout] [get_bd_pins udp_ip_wrapper/regIpAddress_V]
   connect_bd_net -net rst_clk_wiz_0_200M_bus_struct_reset [get_bd_pins microblaze_0_local_memory/SYS_Rst] [get_bd_pins rst_clk_wiz_0_200M/bus_struct_reset]
   connect_bd_net -net rst_clk_wiz_0_200M_interconnect_aresetn [get_bd_pins MicroblazeToSwitch_0/ap_rst_n] [get_bd_pins fast_protocol_0/aresetn] [get_bd_pins microblaze_0_axi_periph/ARESETN] [get_bd_pins network_module/aresetn] [get_bd_pins order_book_0/ap_rst_n] [get_bd_pins rst_clk_wiz_0_200M/interconnect_aresetn] [get_bd_pins simple_threshold_0/aresetn] [get_bd_pins timer_stream_adapter_0/aresetn] [get_bd_pins udpAppMux_0/aresetn] [get_bd_pins udp_ip_wrapper/aresetn]
   connect_bd_net -net rst_clk_wiz_0_200M_mb_reset [get_bd_pins microblaze_0/Reset] [get_bd_pins rst_clk_wiz_0_200M/mb_reset]
   connect_bd_net -net rst_clk_wiz_0_200M_peripheral_aresetn [get_bd_pins mdm_1/S_AXI_ARESETN] [get_bd_pins microblaze_0_axi_periph/M00_ARESETN] [get_bd_pins microblaze_0_axi_periph/M01_ARESETN] [get_bd_pins microblaze_0_axi_periph/M02_ARESETN] [get_bd_pins microblaze_0_axi_periph/S00_ARESETN] [get_bd_pins rst_clk_wiz_0_200M/peripheral_aresetn]
-  connect_bd_net -net rxn_1 [get_bd_ports rxn] [get_bd_pins network_module/rxn]
-  connect_bd_net -net rxp_1 [get_bd_ports rxp] [get_bd_pins network_module/rxp]
-  connect_bd_net -net util_vector_logic_0_Res [get_bd_pins proc_sys_reset_0/ext_reset_in] [get_bd_pins rst_clk_wiz_0_200M/ext_reset_in] [get_bd_pins util_vector_logic_0/Res]
+  # sys_diff_clock -> clk_wiz differential input
+  connect_bd_net -net sys_diff_clock_clk_p_1 [get_bd_ports sys_diff_clock_clk_p] [get_bd_pins clk_wiz_0/clk_in1_p]
+  connect_bd_net -net sys_diff_clock_clk_n_1 [get_bd_ports sys_diff_clock_clk_n] [get_bd_pins clk_wiz_0/clk_in1_n]
+  # NOT(cpu_resetn) -> active-high reset to network_module MAC + LED In2
   connect_bd_net -net util_vector_logic_1_Res [get_bd_pins network_module/reset] [get_bd_pins util_vector_logic_1/Res] [get_bd_pins xlconcat_0/In2]
   connect_bd_net -net xlconcat_0_dout [get_bd_ports led_l] [get_bd_pins xlconcat_0/dout]
+  # PHY reset from network_module to top-level port
+  connect_bd_net -net phy_rst_n_1 [get_bd_ports phy_rst_n] [get_bd_pins network_module/phy_rst_n]
+  # GMII and MDIO interface connections
+  connect_bd_intf_net -intf_net network_module_gmii [get_bd_intf_ports gmii] [get_bd_intf_pins network_module/gmii]
+  connect_bd_intf_net -intf_net network_module_mdio [get_bd_intf_ports mdio] [get_bd_intf_pins network_module/mdio]
 
   # Create address segments
   create_bd_addr_seg -range 0x00010000 -offset 0x44A00000 [get_bd_addr_spaces microblaze_0/Data] [get_bd_addr_segs MicroblazeToSwitch_0/s_axi_AXILiteS/Reg] SEG_MicroblazeToSwitch_0_Reg
@@ -785,110 +798,6 @@ CONFIG.NUM_PORTS {3} \
   create_bd_addr_seg -range 0x00008000 -offset 0x00000000 [get_bd_addr_spaces microblaze_0/Instruction] [get_bd_addr_segs microblaze_0_local_memory/ilmb_bram_if_cntlr/SLMB/Mem] SEG_ilmb_bram_if_cntlr_Mem
   create_bd_addr_seg -range 0x00001000 -offset 0x41400000 [get_bd_addr_spaces microblaze_0/Data] [get_bd_addr_segs mdm_1/S_AXI/Reg] SEG_mdm_1_Reg
   create_bd_addr_seg -range 0x00010000 -offset 0x44A10000 [get_bd_addr_spaces microblaze_0/Data] [get_bd_addr_segs order_book_0/s_axi_AXILiteS/Reg] SEG_order_book_0_Reg
-
-  # Perform GUI Layout
-  regenerate_bd_layout -layout_string {
-   guistr: "# # String gsaved with Nlview 6.6.5b  2016-09-06 bk=1.3687 VDI=39 GEI=35 GUI=JA:1.6
-#  -string -flagsOSRD
-preplace port refclk_n -pg 1 -y 880 -defaultsOSRD
-preplace port refclk_p -pg 1 -y 900 -defaultsOSRD
-preplace port txn -pg 1 -y 910 -defaultsOSRD
-preplace port perst_n -pg 1 -y 710 -defaultsOSRD
-preplace port txp -pg 1 -y 930 -defaultsOSRD
-preplace port user_sw_l -pg 1 -y 10 -defaultsOSRD
-preplace port rxn -pg 1 -y 1010 -defaultsOSRD
-preplace port rxp -pg 1 -y 1030 -defaultsOSRD
-preplace port refclk200 -pg 1 -y 840 -defaultsOSRD
-preplace portBus led_l -pg 1 -y 1040 -defaultsOSRD
-preplace portBus sfp_tx_disable -pg 1 -y 560 -defaultsOSRD
-preplace inst gnd1 -pg 1 -lvl 12 -y 560 -defaultsOSRD
-preplace inst fast_protocol_0 -pg 1 -lvl 8 -y 380 -defaultsOSRD
-preplace inst simple_threshold_0 -pg 1 -lvl 7 -y 380 -defaultsOSRD
-preplace inst microblaze_0_axi_periph -pg 1 -lvl 5 -y 150 -defaultsOSRD
-preplace inst proc_sys_reset_0 -pg 1 -lvl 2 -y 690 -defaultsOSRD
-preplace inst rst_clk_wiz_0_200M -pg 1 -lvl 2 -y 500 -defaultsOSRD
-preplace inst order_book_0 -pg 1 -lvl 6 -y 350 -defaultsOSRD
-preplace inst udpAppMux_0 -pg 1 -lvl 9 -y 310 -defaultsOSRD
-preplace inst xlconcat_0 -pg 1 -lvl 12 -y 1040 -defaultsOSRD
-preplace inst util_vector_logic_0 -pg 1 -lvl 1 -y 720 -defaultsOSRD
-preplace inst c_counter_binary_0 -pg 1 -lvl 7 -y 600 -defaultsOSRD
-preplace inst util_vector_logic_1 -pg 1 -lvl 10 -y 950 -defaultsOSRD
-preplace inst mdm_1 -pg 1 -lvl 3 -y 380 -defaultsOSRD
-preplace inst microblaze_0 -pg 1 -lvl 4 -y 390 -defaultsOSRD
-preplace inst udp_ip_wrapper -pg 1 -lvl 10 -y 610 -defaultsOSRD
-preplace inst clk_wiz_0 -pg 1 -lvl 10 -y 840 -defaultsOSRD
-preplace inst microblaze_0_local_memory -pg 1 -lvl 5 -y 400 -defaultsOSRD
-preplace inst MicroblazeToSwitch_0 -pg 1 -lvl 6 -y 170 -defaultsOSRD
-preplace inst network_module -pg 1 -lvl 11 -y 890 -defaultsOSRD
-preplace inst mac -pg 1 -lvl 9 -y 620 -defaultsOSRD
-preplace inst timer_stream_adapter_0 -pg 1 -lvl 8 -y 620 -defaultsOSRD
-preplace inst ip -pg 1 -lvl 9 -y 700 -defaultsOSRD
-preplace netloc MicroblazeToSwitch_0_rxDataMonitor 1 6 3 NJ 150 NJ 150 3180
-preplace netloc simple_threshold_0_outgoing_meta_V 1 7 1 N
-preplace netloc udpAppMux_0_txMetadataFAST 1 7 3 2620 110 NJ 110 3640
-preplace netloc fast_protocol_0_lbTxLengthOut 1 8 1 3140
-preplace netloc timer_stream_adapter_0_synchTime_2 1 8 1 3170
-preplace netloc rst_clk_wiz_0_200M_bus_struct_reset 1 2 3 NJ 480 NJ 480 1430
-preplace netloc microblaze_0_mdm_axi 1 2 4 650 310 NJ 310 NJ 310 1710
-preplace netloc txDataOut_1 1 9 1 3700
-preplace netloc udp_ip_wrapper_rxDataIn 1 8 3 3200 100 NJ 100 4070
-preplace netloc gnd1_dout 1 12 1 NJ
-preplace netloc fast_protocol_0_order_to_book_V 1 5 4 1770 250 NJ 250 NJ 250 3100
-preplace netloc fast_protocol_0_time_to_book 1 5 4 1760 240 NJ 240 NJ 240 3120
-preplace netloc rxp_1 1 0 11 NJ 1030 NJ 1030 NJ 1030 NJ 1030 NJ 1030 NJ 1030 NJ 1030 NJ 1030 NJ 1030 NJ 1030 4090J
-preplace netloc order_book_0_top_bid_V 1 6 1 2200
-preplace netloc order_book_0_outgoing_time_V_V 1 6 1 2180
-preplace netloc txMetadataOut_1 1 9 1 3670
-preplace netloc udp_ip_wrapper_rxMetadataIn 1 8 3 3190 70 NJ 70 4080
-preplace netloc network_module_M_AXIS 1 9 3 3710 460 NJ 460 4370
-preplace netloc rxn_1 1 0 11 NJ 1010 NJ 1010 NJ 1010 NJ 1010 NJ 1010 NJ 1010 NJ 1010 NJ 1010 NJ 1010 NJ 1010 4060J
-preplace netloc mac_dout 1 9 1 3650J
-preplace netloc fast_protocol_0_tagsOut 1 8 1 3130
-preplace netloc fast_protocol_0_lbRequestPortOpenOut 1 8 1 3150
-preplace netloc util_vector_logic_0_Res 1 1 1 270
-preplace netloc microblaze_0_ilmb_1 1 4 1 N
-preplace netloc microblaze_0_axi_periph_M00_AXI 1 5 1 1720
-preplace netloc order_book_0_top_ask_V 1 6 1 2190
-preplace netloc fast_protocol_0_metadata_to_book 1 5 4 1750 100 NJ 100 NJ 100 3110
-preplace netloc refclk200_1 1 0 10 NJ 840 NJ 840 NJ 840 NJ 840 NJ 840 NJ 840 NJ 840 NJ 840 NJ 840 NJ
-preplace netloc microblaze_0_axi_dp 1 4 1 1390
-preplace netloc udpAppMux_0_txDataFAST 1 7 3 2610 90 NJ 90 3650
-preplace netloc fast_protocol_0_lbTxMetadataOut 1 8 1 3160
-preplace netloc refclk_n_1 1 0 11 NJ 880 NJ 880 NJ 880 NJ 880 NJ 880 NJ 880 NJ 880 NJ 880 NJ 880 3680J 890 4070J
-preplace netloc c_counter_binary_0_Q 1 7 1 NJ
-preplace netloc xlconcat_0_dout 1 12 1 NJ
-preplace netloc network_module_txn 1 11 2 NJ 910 NJ
-preplace netloc microblaze_0_axi_periph_M01_AXI 1 5 1 N
-preplace netloc order_book_0_outgoing_meta_V 1 6 1 2170
-preplace netloc txLengthOut_1 1 9 1 3690
-preplace netloc clk_wiz_0_clk_100MHz 1 10 1 4060J
-preplace netloc rst_clk_wiz_0_200M_mb_reset 1 2 2 N 460 930J
-preplace netloc rst_clk_wiz_0_200M_peripheral_aresetn 1 2 3 650 540 NJ 540 1420
-preplace netloc regIpAddress_V_1 1 9 1 3690J
-preplace netloc psert_n_1 1 0 12 10 1020 NJ 1020 NJ 1020 NJ 1020 NJ 1020 NJ 1020 NJ 1020 NJ 1020 NJ 1020 3670 1020 NJ 1020 NJ
-preplace netloc udpAppMux_0_txTimeFAST 1 7 3 2620 520 NJ 520 3640
-preplace netloc fast_protocol_0_lbTxDataOut 1 8 1 3130
-preplace netloc rst_clk_wiz_0_200M_interconnect_aresetn 1 2 9 630J 750 NJ 750 1410 750 1740 750 2200 750 2610 750 3190 750 3700 750 4080J
-preplace netloc network_module_txp 1 11 2 NJ 930 NJ
-preplace netloc microblaze_0_dlmb_1 1 4 1 N
-preplace netloc simple_threshold_0_outgoing_time_V_V 1 7 1 2600
-preplace netloc udp_ip_wrapper_portOpenReplyIn 1 8 3 3200 510 3650J 470 4060
-preplace netloc udp_ip_wrapper_AXI_M_Stream 1 10 1 4090
-preplace netloc clk_wiz_0_clk_200MHz 1 1 11 290 870 640 870 920 870 1400 870 1730 870 2180 870 2600 870 3180 870 3670 740 NJ 740 4360
-preplace netloc util_vector_logic_1_Res 1 10 2 4070 1060 NJ
-preplace netloc microblaze_0_debug 1 3 1 920
-preplace netloc MicroblazeToSwitch_0_rxMetadataMonitor_V 1 6 3 NJ 170 NJ 170 3170
-preplace netloc udpAppMux_0_txReplyPortFAST 1 7 3 2600 60 NJ 60 3660
-preplace netloc mdm_1_debug_sys_rst 1 1 3 280 280 NJ 280 910
-preplace netloc network_module_network_reset_done 1 0 12 20 1040 NJ 1040 NJ 1040 NJ 1040 NJ 1040 NJ 1040 NJ 1040 NJ 1040 NJ 1040 NJ 1040 NJ 1040 4370
-preplace netloc MicroblazeToSwitch_0_rxLengthMonitor_V_V 1 6 3 NJ 190 NJ 190 3160
-preplace netloc simple_threshold_0_outgoing_order_V 1 7 1 N
-preplace netloc udpAppMux_0_txRequestPortNetwork 1 9 1 3680
-preplace netloc timer_stream_adapter_0_synchTime_1 1 8 1 3150
-preplace netloc refclk_p_1 1 0 11 NJ 900 NJ 900 NJ 900 NJ 900 NJ 900 NJ 900 NJ 900 NJ 900 NJ 900 NJ 900 NJ
-levelinfo -pg 1 -10 150 460 780 1160 1570 1970 2400 2870 3420 3890 4230 4470 4580 -top -10 -bot 1110
-",
-}
 
   # Restore current instance
   current_bd_instance $oldCurInst
