@@ -10,4 +10,4 @@ update_compile_order -fileset sources_1
 update_compile_order -fileset sim_1
 
 # Add XDC
-add_files -norecurse ad_8k5.xdc
+add_files -norecurse kc705.xdc
